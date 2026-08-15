@@ -4,12 +4,27 @@ import { placeLoad, freeLoad, fmtMoney, floorThermal } from './sim.js';
 
 let cid = 1;
 
+/* 인수 시점의 시설 — **빈 방이 아니라 돌아가는 데이터센터**를 물려받는다.
+ *
+ * ★ 예전엔 빈 바닥에서 시작했다. 그러면 첫 몇 분이 통째로 "짓기"이고, 돈이
+ *   들어오기 시작할 때까지 게임 내 한 달이 걸린다. 로그는 "데이터센터를
+ *   인수했다"고 하는데 화면은 빈 방이라 말과 그림도 안 맞았다.
+ *   작게라도 이미 도는 시설을 주면 첫 판단(계약을 받을까? 열은 되나?)이
+ *   바로 시작되고, 증설의 효과가 '전과 후'로 보인다. */
+function starterFloor() {
+  const f = makeFloor();
+  const put = (i, type) => (f.tiles[i] = { type, loadKw: 0, broken: false, efficiency: 1 });
+  [0, 1, 8, 9].forEach((i) => put(i, 'rack_std'));      // 표준랙 4 = 40kW
+  [16, 17].forEach((i) => put(i, 'crac'));              // CRAC 2 = 제열 80kW
+  return f;
+}
+
 export function newGame() {
   return {
     minutes: 8 * 60,
-    cash: 900_000_000,
+    cash: 1_200_000_000,
     reputation: 20,
-    floors: [makeFloor()],
+    floors: [starterFloor()],
     plantCounts: { feed: 1, transformer: 1, ups: 1, chiller: 1, generator: 0, economizer: 0 },
     plant: {},
     staff: [],
@@ -17,7 +32,7 @@ export function newGame() {
     offers: [],
     repairs: [],
     log: [],
-    ledger: { revenue: 0, power: 0, opex: 0, penalty: 0, capex: 0 },
+    ledger: { revenue: 0, power: 0, opex: 0, penalty: 0, capex: 0, incident: 0 },
     utilityDown: false, utilityMin: 0,
     heatwave: 0, heatwaveMin: 0,
     chillerDown: false, chillerMin: 0,
@@ -120,7 +135,9 @@ export function hire(S, id) {
 /* 제안 생성 — 평판이 좋을수록 좋은 계약이 온다. */
 export function refreshOffers(S) {
   const pool = CONTRACT_TYPES.filter((t) => S.reputation >= t.minRep);
-  const want = 3;
+  /* 제안이 3개뿐이면 현금이 있어도 늘릴 수가 없다 — 성장 속도의 상한이
+     자금이 아니라 '들어오는 일감 수'가 되어 버린다. */
+  const want = 5;
   while (S.offers.length < want) {
     const t = pool[Math.floor(Math.random() * pool.length)];
     const rnd = (a, b) => a + Math.random() * (b - a);
@@ -129,6 +146,11 @@ export function refreshOffers(S) {
       id: cid++, type: t.id, name: t.name, color: t.color, flavor: t.flavor,
       kw, baseKw: kw, rate: Math.round(rnd(t.rate[0], t.rate[1]) / 1000) * 1000,
       months: Math.round(rnd(t.months[0], t.months[1])), sla: t.sla, needs: t.needs,
+      /* ★ 제안에 유효기간을 준다. 없으면 못 받는 제안(예: 액랭 설비가 없는데
+         들어온 AI 계약)이 목록을 영구히 막는다. 평판이 100 이 된 시뮬레이션에서
+         5칸이 전부 액랭 건으로 차서, 받을 수 있는 공랭 계약이 3년째에
+         10건 → 3건으로 줄었다. 일감이 없어서가 아니라 자리가 없어서였다. */
+      expiresAt: S.minutes + 60 * 24 * (5 + Math.floor(Math.random() * 9)),
     });
   }
 }

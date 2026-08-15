@@ -86,3 +86,13 @@ main{flex:1; display:grid; grid-template-columns:270px 1fr 300px; min-height:0}
   .panel{border:none; border-top:1px solid var(--line); max-height:210px}
   .panel.left{order:2} .stage{order:1} .panel.right{order:3}
 }
+
+/* 손익표 — 숫자를 읽는 화면이라 정렬이 곧 가독성이다 */
+.pnlrow { display:flex; justify-content:space-between; align-items:baseline;
+          padding:4px 0; font-size:12px; border-bottom:1px solid var(--line); }
+.pnlrow span { color:var(--dim); }
+.pnlrow b { font-variant-numeric:tabular-nums; letter-spacing:-.2px; }
+.pnlrow.tot { border-bottom:none; margin-top:4px; padding-top:7px;
+              border-top:1px solid var(--dim2); font-size:13px; }
+.pnlrow.tot span { color:var(--ink); }
+.pnlnote { font-size:11px; color:var(--dim2); margin:-1px 0 4px; line-height:1.45; }

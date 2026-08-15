@@ -5,7 +5,7 @@
  * 목록은 내용이 실제로 달라졌을 때만 다시 그린다.
  */
 import { RACKS, COOLERS, PLANT, STAFF, PLACEABLE, FLOOR_COST } from './catalog.js';
-import { fmtMoney } from './sim.js';
+import { fmtMoney, netWorth } from './sim.js';
 import * as W from './world.js';
 
 const $ = (id) => document.getElementById(id);
@@ -33,8 +33,13 @@ function statHtml(S) {
   const tC = hot > 34 ? 'bad' : hot > 28 ? 'warn' : 'good';
   const fC = feedPct > 92 ? 'bad' : feedPct > 78 ? 'warn' : '';
   const cash = S.cash < 0 ? 'bad' : '';
+  const nw = netWorth(S);
+  const pnl = S.pnl;
+  const opC = !pnl ? '' : pnl.operating > 0 ? 'good' : 'bad';
   return `
     <div class="stat"><b class="${cash}">${fmtMoney(S.cash)}원</b><span>자금</span></div>
+    <div class="stat"><b>${fmtMoney(nw.total)}원</b><span>순자산 (설비 ${fmtMoney(nw.asset)})</span></div>
+    <div class="stat"><b class="${opC}">${pnl ? (pnl.operating >= 0 ? '+' : '') + fmtMoney(pnl.operating) : '—'}</b><span>지난달 영업이익</span></div>
     <div class="stat"><b>${day} ${hm}</b><span>날짜</span></div>
     <div class="stat"><b>${S.reputation.toFixed(0)}</b><span>평판</span></div>
     <div class="stat"><b class="${fC}">${S.demandKw.toFixed(0)} / ${S.plant.feedKw} kW</b><span>전력 (수전 대비 ${feedPct.toFixed(0)}%)</span></div>
@@ -44,7 +49,8 @@ function statHtml(S) {
     <div class="stat"><b class="${head < 0 ? 'bad' : head < 20 ? 'warn' : ''}">${head >= 0 ? '+' : ''}${head.toFixed(0)} kW</b><span>제열 여유 (${state.floorIdx + 1}F)</span></div>
     <div class="stat"><b>${S.outsideC.toFixed(1)}℃</b><span>외기${S.heatwave ? ' (폭염)' : ''}</span></div>
     ${S.utilityDown ? `<div class="stat"><b class="bad">${S.onGenerator ? `발전기 · 연료 ${S.plant.fuelL.toFixed(0)}L` : `배터리 ${S.plant.batteryKwh.toFixed(1)}kWh`}</b><span>정전 중</span></div>` : ''}
-    ${S.blackout ? `<div class="stat"><b class="bad">${esc(S.trips.join(', '))}</b><span>차단</span></div>` : ''}`;
+    ${S.blackout ? `<div class="stat"><b class="bad">${esc(S.trips.join(', '))}</b><span>전면 정전</span></div>` : ''}
+    ${!S.blackout && S.shedKw > 0 ? `<div class="stat"><b class="bad">${S.shedKw.toFixed(0)} kW</b><span>용량 초과로 차단됨 (${esc((S.shedNames || []).join(', '))})</span></div>` : ''}`;
 }
 
 export function renderStats(S) { $('stats').innerHTML = statHtml(S); }
@@ -146,6 +152,54 @@ export function renderActive(S) {
   });
 }
 
+/* 손익 — 돈이 어디로 갔는지.
+ *
+ * ★ 이 화면이 없어서 문제를 못 봤다. 3년 시뮬레이션에서 매출·전기·opex·capex 를
+ *   다 더해도 44억이 비었는데, 그게 전부 **사고 대응비**였고 장부에 안 잡혔다.
+ *   플레이어에게는 "열심히 했는데 돈이 준다"로만 보였을 것이다.
+ *   경영 시뮬레이션에서 손익표는 편의 기능이 아니라 본체다. */
+export function renderPnl(S) {
+  const p = S.pnl;
+  const nw = netWorth(S);
+  /* 순자산은 매 틱 바뀐다 — 그대로 서명에 쓰면 매 프레임 다시 그려서 스크롤이
+     튄다. 백만원 단위로 뭉개면 눈에 띄는 변화만 다시 그린다. */
+  once('pnl', `${p ? p.net.toFixed(0) : 'x'}|${Math.round(nw.total / 1e6)}`, () => {
+    const line = (label, v, sign, note) => `
+      <div class="pnlrow"><span>${label}</span>
+        <b class="${sign > 0 ? 'good' : sign < 0 ? 'bad' : ''}">${sign < 0 ? '−' : sign > 0 ? '+' : ''}${fmtMoney(Math.abs(v))}</b>
+      </div>${note ? `<div class="pnlnote">${note}</div>` : ''}`;
+    $('tabPnl').innerHTML = `
+      <div class="item">
+        <h4><span>순자산</span><span class="price">${fmtMoney(nw.total)}</span></h4>
+        <div class="spec">현금 ${fmtMoney(S.cash)} + 설비 장부가 ${fmtMoney(nw.asset)}</div>
+        <p>증설은 돈이 사라지는 것이 아니라 <b>자산으로 옮겨 가는 것</b>이다.
+           현금만 보면 투자가 전부 손실로 보인다.</p>
+      </div>
+      ${!p ? `<div class="empty">첫 달 결산까지 기다린다.<br>한 달이 지나면 여기에 손익이 뜬다.</div>` : `
+      <div class="item">
+        <h4><span>지난달 손익</span>
+            <span class="price ${p.net >= 0 ? 'good' : 'bad'}">${p.net >= 0 ? '+' : '−'}${fmtMoney(Math.abs(p.net))}</span></h4>
+        ${line('매출', p.revenue, 1)}
+        ${line('전기요금', p.power, -1, `PUE ${S.pue ? S.pue.toFixed(2) : '—'} — IT 1kW 마다 ${S.pue ? S.pue.toFixed(2) : '—'}kW 를 낸다`)}
+        ${line('고정비 (장비·설비·급여)', p.opex, -1)}
+        ${line('사고 대응비', p.incident, -1, '수리·외주·방어장비·복구. 여기가 크면 예방이 싸다')}
+        ${line('SLA 위약금', p.penalty, -1)}
+        <div class="pnlrow tot"><span>영업이익</span>
+          <b class="${p.operating >= 0 ? 'good' : 'bad'}">${p.operating >= 0 ? '+' : '−'}${fmtMoney(Math.abs(p.operating))}</b></div>
+        ${line('증설 투자 (capex)', p.capex, -1, '자산으로 남는다 — 위 순자산에 더해져 있다')}
+      </div>`}
+      <div class="item">
+        <h4><span>누적</span></h4>
+        ${line('매출', S.ledger.revenue, 1)}
+        ${line('전기요금', S.ledger.power, -1)}
+        ${line('고정비', S.ledger.opex, -1)}
+        ${line('사고 대응비', S.ledger.incident || 0, -1)}
+        ${line('위약금', S.ledger.penalty, -1)}
+        ${line('증설 투자', S.ledger.capex, -1)}
+      </div>`;
+  });
+}
+
 export function renderLog(S) {
   once('log', S.log.length ? `${S.log.length}:${S.log[0].t}` : '0', () => {
     $('tabLog').innerHTML = S.log.length ? S.log.map((l) => {
@@ -171,18 +225,28 @@ export function hint(msg, ms = 2600) {
   hintTimer = setTimeout(() => el.classList.remove('show'), ms);
 }
 
-export function showEvent(ev, onPick) {
+export function showEvent(S, ev, onPick) {
   $('mTitle').textContent = ev.name;
   $('mText').textContent = ev.text;
-  $('mOpts').innerHTML = ev.options.map((o, i) => `
-    <button class="opt" data-opt="${i}">
+  /* ★ 직원이 없어 못 고르는 선택지를 그냥 보여 주면, 눌렀을 때 "그 직원이
+     없다"는 로그만 남고 **사고가 아무 조치 없이 사라진다.** 4분짜리 실주행에서
+     정확히 이게 일어났다 — 기술자 없이 '자체 수리'를 고르는 바람에 CRAC 두 대가
+     고장 난 채 복구되지 않았고 실온이 75℃ 까지 갔다. 고를 수 없는 것은
+     고를 수 없게 보여야 한다. */
+  $('mOpts').innerHTML = ev.options.map((o, i) => {
+    const blocked = o.needStaff && !S.staff.some((s) => s.id === o.needStaff);
+    return `
+    <button class="opt" data-opt="${i}" ${blocked ? 'disabled' : ''}>
       <b>${o.label}</b>
       ${o.cost ? `<span class="cost">비용 ${fmtMoney(o.cost)}${o.minutes ? ` · ${o.minutes}분` : ''}</span>` : ''}
-      ${o.note ? `<small>${o.note}</small>` : ''}
-    </button>`).join('');
+      ${blocked ? `<small class="bad">${STAFF[o.needStaff].name} 가 없어 고를 수 없다 — 인력 탭에서 채용한다</small>`
+                : o.note ? `<small>${o.note}</small>` : ''}
+    </button>`;
+  }).join('');
   $('modal').classList.remove('hide');
   $('mOpts').onclick = (e) => {
-    const b = e.target.closest('[data-opt]'); if (!b) return;
+    const b = e.target.closest('[data-opt]');
+    if (!b || b.disabled) return;
     $('modal').classList.add('hide');
     onPick(ev.options[+b.dataset.opt]);
   };

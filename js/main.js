@@ -77,14 +77,14 @@ function tabs(barId, prefix) {
   $(barId).addEventListener('click', (e) => {
     const b = e.target.closest('[data-tab]'); if (!b) return;
     [...$(barId).children].forEach((x) => x.classList.toggle('on', x === b));
-    for (const t of ['build', 'plant', 'staff', 'offers', 'active', 'log']) {
+    for (const t of ['build', 'plant', 'staff', 'offers', 'active', 'pnl', 'log']) {
       const el = $('tab' + t[0].toUpperCase() + t.slice(1));
       if (el && el.id.startsWith('tab') && prefix.includes(t)) el.classList.toggle('hide', t !== b.dataset.tab);
     }
   });
 }
 tabs('leftTabs', ['build', 'plant', 'staff']);
-tabs('rightTabs', ['offers', 'active', 'log']);
+tabs('rightTabs', ['offers', 'active', 'pnl', 'log']);
 
 document.body.addEventListener('click', (e) => {
   const el = e.target.closest('[data-tool],[data-plant],[data-hire],[data-accept],[data-reject],[data-drop],[data-floor],#btnFloor');
@@ -108,21 +108,26 @@ $('btnReset').onclick = () => {
   W.clearSave(); S = W.newGame(); W.recalcPlant(S); W.refreshOffers(S);
   U.state.floorIdx = view.floorIdx = 0; U.invalidate();
 };
+function setSpeedUI(v) {
+  document.querySelectorAll('.speed [data-speed]').forEach((x) => x.classList.toggle('on', +x.dataset.speed === v));
+}
 document.querySelectorAll('.speed [data-speed]').forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll('.speed [data-speed]').forEach((x) => x.classList.toggle('on', x === b));
-    S.speed = +b.dataset.speed;
-  };
+  b.onclick = () => { S.speed = +b.dataset.speed; setSpeedUI(S.speed); };
 });
 window.addEventListener('keydown', (e) => {
-  if (e.key === ' ') { e.preventDefault(); S.speed = S.speed ? 0 : 1;
-    document.querySelectorAll('.speed [data-speed]').forEach((x) => x.classList.toggle('on', +x.dataset.speed === S.speed)); }
+  if (e.key === ' ') { e.preventDefault();
+    if (S.speed) { S.lastSpeed = S.speed; S.speed = 0; } else { S.speed = S.lastSpeed || 1; }
+    setSpeedUI(S.speed); }
   if (e.key === 'Escape') { U.state.tool = null; U.invalidate(); }
 });
 
 /* ── 루프 ────────────────────────────────────────────────── */
 let acc = 0, last = Date.now(), lastOffer = 0, lastSave = 0;
-const MS_PER_TICK = 260;
+/* ★ 260ms/게임분은 너무 느렸다. 16× 를 켜도 게임 내 한 달에 실시간 11.7분,
+   투자 회수까지 17개월이면 5시간이다. 경영 시뮬레이션은 앞의 몇 분 안에
+   '늘어나는 것'이 보여야 한다. 90ms 로 줄이고 60× 를 추가했다 —
+   최고 배속에서 한 달이 약 65초, 3년이 약 40분이다. */
+const MS_PER_TICK = 90;
 
 function tickOnce() {
   const notes = step(S);
@@ -143,19 +148,25 @@ function tickOnce() {
   if (!S.pendingEvent) {
     const ev = maybeFire(S);
     if (ev) {
+      /* 사고 전 배속을 기억했다가 그대로 돌려준다. 예전엔 처리 후 무조건 1× 로
+         떨어져서, 60× 로 보고 있던 사람이 사고를 처리할 때마다 배속을 다시
+         눌러야 했다. 사고는 판단을 요구하는 것이지 조작을 요구하는 게 아니다. */
+      const resume = S.speed || 1;
       S.pendingEvent = true; S.speed = 0;
-      document.querySelectorAll('.speed [data-speed]').forEach((x) => x.classList.toggle('on', +x.dataset.speed === 0));
+      setSpeedUI(0);
       W.log(S, 'warn', `사고 발생 — ${ev.name}`);
-      U.showEvent(ev, (opt) => {
+      U.showEvent(S, ev, (opt) => {
         for (const l of resolve(S, ev, opt)) W.log(S, l.kind, l.msg);
-        S.pendingEvent = null; S.speed = 1;
-        document.querySelectorAll('.speed [data-speed]').forEach((x) => x.classList.toggle('on', +x.dataset.speed === 1));
+        S.pendingEvent = null; S.speed = resume;
+        setSpeedUI(resume);
         U.invalidate();
       });
     }
   }
   // 제안 갱신 — 게임 내 하루에 한 번 정도
-  if (S.minutes - lastOffer > 60 * 20) { lastOffer = S.minutes; if (S.offers.length < 3) W.refreshOffers(S); }
+  const nOff = S.offers.length;
+  S.offers = S.offers.filter((o) => !o.expiresAt || S.minutes < o.expiresAt);
+  if (S.offers.length !== nOff || S.minutes - lastOffer > 60 * 8) { lastOffer = S.minutes; W.refreshOffers(S); }
   // 자동 저장 — 게임 내 하루에 한 번
   if (S.minutes - lastSave > 60 * 24) { lastSave = S.minutes; W.save(S); }
 
@@ -194,7 +205,7 @@ function frame() {
   view.ghost = !!U.state.tool;
   draw(ctx, S, view);
   U.renderBuild(S); U.renderPlant(S); U.renderStaff(S);
-  U.renderOffers(S); U.renderActive(S); U.renderLog(S); U.renderFloorbar(S);
+  U.renderOffers(S); U.renderActive(S); U.renderPnl(S); U.renderLog(S); U.renderFloorbar(S);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -208,11 +219,11 @@ if (new URLSearchParams(location.search).has('demo')) {
   S.cash = 2_000_000_000;
   for (const k of ['feed', 'transformer', 'ups', 'chiller']) { W.buyPlant(S, k); W.buyPlant(S, k); }
   W.buyPlant(S, 'generator');
+  /* 인수 시설이 0,1,8,9(표준랙)과 16,17(CRAC)을 이미 쓰고 있다 — 빈 자리에만 짓는다 */
   const put = (i, type) => W.build(S, 0, i, type);
-  [0, 1, 2, 8, 9, 10, 16, 17, 18].forEach((i) => put(i, 'rack_std'));
-  [3, 11, 19].forEach((i) => put(i, 'rack_hd'));
-  [6, 14, 22].forEach((i) => put(i, 'crac'));
-  put(7, 'inrow');
+  [2, 3, 10, 11].forEach((i) => put(i, 'rack_std'));
+  [4, 12, 20, 21].forEach((i) => put(i, 'rack_hd'));
+  [18, 19, 26].forEach((i) => put(i, 'inrow'));
   W.hire(S, 'tech'); W.hire(S, 'ops');
   W.refreshOffers(S);
   for (const o of [...S.offers]) W.accept(S, o.id);

@@ -53,8 +53,10 @@ export function floorThermal(floor, outC, econCount) {
     const spec = PLACEABLE[t.type];
     if (!spec) continue;
     if (spec.kind === 'rack') {
-      if (spec.cooling === 'liquid') itLiq += t.loadKw || 0;
-      else itAir += t.loadKw || 0;
+      /* 차단된(shed) 몫은 열도 안 낸다 — 끊었으면 진짜로 끊긴 것이다 */
+      const load = Math.max(0, (t.loadKw || 0) - (t.shedKw || 0));
+      if (spec.cooling === 'liquid') itLiq += load;
+      else itAir += load;
     } else if (spec.kind === 'cooler' && !t.broken) {
       const cop = effectiveCop(spec.cop, outC, econCount);
       const cap = spec.removeKw * (t.efficiency ?? 1);
@@ -83,6 +85,47 @@ export function coolingWork(th, floorTemp, chillerAvail) {
   return { removed: remAir + remLiq, kw, limited: airRatio < 0.999 };
 }
 
+/* 전력 경로가 감당 못 하는 만큼을 **끊는다.**
+ *
+ * ★ 예전엔 어느 지점이든 용량을 넘으면 S.blackout = true 로 **전부** 죽였다.
+ *   그러면 매출이 0 이 되는데 위약금은 계속 나가고, 현금이 없으니 증설도 못 한다.
+ *   3년 시뮬레이션에서 한 번 넘긴 판이 -38억까지 갔고 회복 경로가 없었다.
+ *   실제 시설은 그렇게 동작하지 않는다 — 차단기는 가지에서 떨어지지 건물 전체를
+ *   내리지 않고, 운영자는 무엇을 지킬지 정한다. 그래서 **단가가 높은 계약부터
+ *   지키고 낮은 것부터 끊는다.** 증설하면 끊긴 것이 저절로 돌아온다.
+ *   벌은 남되(끊긴 계약은 SLA 가 깎인다) 되돌릴 수 있어야 배움이 된다.
+ */
+const IT_TO_DEMAND = 1.45;        // IT 1kW 가 데려오는 총수요(냉각·손실 포함) 어림값
+
+function applyShedding(S) {
+  const P = S.plant;
+  const capKw = S.utilityDown
+    ? (P.genKw > 0 && P.fuelL > 5 ? P.genKw : Infinity)   // 배터리 구간은 아래에서 따로 본다
+    : Math.min(P.feedKw, P.trafoKw);
+  /* ★ UPS 는 **IT 부하만** 받친다. 냉각기·펌프는 UPS 뒤가 아니라 발전기 뒤에
+     붙는다 — 실제 시설이 그렇게 짓는다. 정전 순간 서버는 한 사이클도 놓치면
+     안 되지만, 냉각은 수십 초 멈춰도 실온이 안 변하기 때문이다.
+     예전엔 UPS 가 총수요를 다 받쳐야 해서, 총 capex 14.3억 중 3.2억이 UPS 였다.
+     비싼 데다 틀린 모형이었다. */
+  const budget = Math.min(capKw / IT_TO_DEMAND, P.upsKw / 1.1);
+
+  const act = S.contracts.filter((c) => c.active).sort((a, b) => b.rate - a.rate);
+  let acc = 0;
+  const cut = [];
+  for (const c of act) {
+    if (acc + c.kw <= budget) { acc += c.kw; c.shed = false; }
+    else { c.shed = true; cut.push(c); }
+  }
+  for (const f of S.floors) for (const t of f.tiles) if (t) t.shedKw = 0;
+  for (const c of cut) for (const p of c.placed || []) {
+    const t = S.floors[p.floor]?.tiles[p.tile];
+    if (t) t.shedKw = (t.shedKw || 0) + p.kw;
+  }
+  S.shedKw = cut.reduce((a, c) => a + c.kw, 0);
+  S.shedNames = cut.map((c) => c.name);
+  return cut.length;
+}
+
 /* 한 틱을 전진시킨다. state 를 직접 고치고, 그 틱에 벌어진 일을 돌려준다. */
 export function step(S) {
   const notes = [];
@@ -96,6 +139,15 @@ export function step(S) {
     S.ddosUntil = 0;
     for (const c of S.contracts) if (c.active) c.kw = c.baseKw;
     notes.push({ kind: 'info', msg: '트래픽이 평시 수준으로 돌아왔다' });
+  }
+
+  /* ── 0. 감당 못 할 부하를 먼저 끊는다 ──────────────────── */
+  const wasShed = S.shedKw || 0;
+  applyShedding(S);
+  if ((S.shedKw || 0) !== wasShed) {
+    notes.push(S.shedKw > wasShed
+      ? { kind: 'bad', msg: `전력 용량 초과 — ${S.shedNames.join(', ')} 차단 (${S.shedKw.toFixed(0)}kW). 경로를 증설하면 돌아온다` }
+      : { kind: 'good', msg: S.shedKw > 0 ? `일부 복전 — 아직 ${S.shedKw.toFixed(0)}kW 가 끊겨 있다` : '차단된 부하가 모두 복전됐다' });
   }
 
   /* ── 1. 층별 열 ─────────────────────────────────────────── */
@@ -137,7 +189,7 @@ export function step(S) {
   S.pue = itKw > 0 ? demandKw / itKw : 0;
 
   const P = S.plant;
-  S.trips = [];
+  S.trips = []; S.warns = [];
   if (S.utilityDown) {
     if (P.genKw > 0 && P.fuelL > 5) {
       S.onGenerator = true;
@@ -154,18 +206,20 @@ export function step(S) {
     S.onGenerator = false;
     if (P.batteryKwh < P.batteryKwhMax) P.batteryKwh = Math.min(P.batteryKwhMax, P.batteryKwh + 0.4);
     if (P.fuelL < P.fuelLMax) P.fuelL = Math.min(P.fuelLMax, P.fuelL + 0.5);
-    if (demandKw > P.feedKw)  S.trips.push('수전 용량 초과');
-    if (demandKw > P.trafoKw) S.trips.push('변압기 용량 초과');
-    if (demandKw > P.upsKw)   S.trips.push('UPS 용량 초과');
+    /* 여기서는 '전면 정전'이 아니라 **경고**다 — 초과분은 위에서 이미 끊었다.
+       그래도 냉각 여력까지 겹치면 순간적으로 넘을 수 있으므로 표시는 남긴다. */
+    if (demandKw > P.feedKw)  S.warns.push('수전 용량 초과');
+    if (demandKw > P.trafoKw) S.warns.push('변압기 용량 초과');
+    if (itKw > P.upsKw)       S.warns.push('UPS 용량 초과');   // UPS 는 IT 부하만 본다
   }
-  S.blackout = S.trips.length > 0;
+  S.blackout = S.trips.length > 0;                    // 전면 정전은 배터리 소진뿐이다
 
   /* ── 3. 서비스 품질 ─────────────────────────────────────── */
   let served = 0, degraded = 0;
   for (const c of S.contracts) {
     if (!c.active) continue;
     const f = S.floors[c.floor];
-    let ok = !S.blackout && !(f && f.powerOff);
+    let ok = !S.blackout && !c.shed && !(f && f.powerOff);
     if (ok && f) {
       if (f.tempC > 40) ok = false;                    // 셧다운 구간
       else if (f.tempC > 28) degraded += c.kw;         // 스로틀 — SLA 는 깎인다
@@ -183,7 +237,7 @@ export function step(S) {
   for (const c of S.contracts) {
     if (!c.active) continue;
     const f = S.floors[c.floor];
-    const down = S.blackout || (f && (f.tempC > 40 || f.powerOff));
+    const down = S.blackout || c.shed || (f && (f.tempC > 40 || f.powerOff));
     const slow = f && f.tempC > 28;
     if (down) continue;                                 // 못 준 만큼은 못 받는다
     revenue += (c.kw * c.rate / (30 * 24)) * hours * (slow ? 0.6 : 1);
@@ -209,7 +263,7 @@ export function step(S) {
   for (const c of S.contracts) {
     if (!c.active) continue;
     c.monthMin = (c.monthMin || 0) + TICK_MIN;
-    c.monthDown = (c.monthDown || 0) + ((S.blackout || (S.floors[c.floor] && (S.floors[c.floor].tempC > 40 || S.floors[c.floor].powerOff))) ? TICK_MIN : 0);
+    c.monthDown = (c.monthDown || 0) + ((S.blackout || c.shed || (S.floors[c.floor] && (S.floors[c.floor].tempC > 40 || S.floors[c.floor].powerOff))) ? TICK_MIN : 0);
     if (c.monthMin >= 30 * 24 * 60) {
       const up = (1 - c.monthDown / c.monthMin) * 100;
       if (up < c.sla) {
@@ -224,6 +278,42 @@ export function step(S) {
       }
       c.monthMin = 0; c.monthDown = 0;
     }
+  }
+
+  /* ── 4.6 월 단위 회사 평가 — 평판은 여기서 오른다 ────────
+   *
+   * ★ 예전엔 평판이 **계약 만료 때만** +2 씩 올랐다. 계약이 6~36개월이니
+   *   3년을 완벽하게 운영해도 평판이 20 → 40 이었고, 스트리밍(40)·AI 추론(55)·
+   *   AI 학습(70) 은 사실상 도달 불가였다. GPU 랙도 CDU 도 액랭도 **존재만 하고
+   *   평생 못 보는 콘텐츠**였다 — 3년 시뮬레이션으로 확인했다.
+   *   잘 굴린 달은 잘 굴렸다고 쳐 줘야 다음 단계로 넘어간다. */
+  S.monthKwMin = (S.monthKwMin || 0) + S.servedKw * TICK_MIN + (S.shedKw || 0) * TICK_MIN;
+  S.monthOkKwMin = (S.monthOkKwMin || 0) + (S.servedKw - S.degradedKw * 0.5) * TICK_MIN;
+  S.reviewMin = (S.reviewMin || 0) + TICK_MIN;
+  if (S.reviewMin >= 30 * 24 * 60) {
+    S.reviewMin = 0;
+    /* 지난 달 손익을 통째로 떠 둔다 — 화면에 '이번 달에 얼마 벌었나'를 보여 준다 */
+    const prev = S.ledgerPrev || { revenue: 0, power: 0, opex: 0, penalty: 0, capex: 0, incident: 0 };
+    const L = S.ledger;
+    S.pnl = {
+      revenue: L.revenue - prev.revenue, power: L.power - prev.power,
+      opex: L.opex - prev.opex, penalty: L.penalty - prev.penalty,
+      incident: (L.incident || 0) - (prev.incident || 0), capex: L.capex - prev.capex,
+    };
+    S.pnl.operating = S.pnl.revenue - S.pnl.power - S.pnl.opex - S.pnl.penalty - S.pnl.incident;
+    S.pnl.net = S.pnl.operating - S.pnl.capex;
+    S.ledgerPrev = { ...L };
+    const q = S.monthKwMin > 0 ? S.monthOkKwMin / S.monthKwMin : 0;
+    let gain = q >= 0.999 ? 4 : q >= 0.995 ? 3 : q >= 0.99 ? 2 : 0;
+    if (gain > 0) {
+      if (S.servedKw >= 200) gain += 1;              // 규모가 곧 신뢰가 된다
+      if (S.servedKw >= 500) gain += 1;
+      const before = S.reputation;
+      S.reputation = Math.min(100, S.reputation + gain);
+      if (S.reputation > before)
+        notes.push({ kind: 'good', msg: `월간 운영 평가 — 무장애 ${(q * 100).toFixed(2)}% · 평판 +${S.reputation - before} (${S.reputation})` });
+    }
+    S.monthKwMin = 0; S.monthOkKwMin = 0;
   }
 
   /* ── 5. 계약 만료 ───────────────────────────────────────── */
@@ -285,6 +375,22 @@ export function freeLoad(S, contract) {
     if (t) t.loadKw = Math.max(0, (t.loadKw || 0) - p.kw);
   }
   contract.placed = [];
+}
+
+/* 순자산 — 현금 + 깔아 놓은 것의 값어치.
+ *
+ * ★ 화면에 **현금만** 있으면 증설이 전부 손실로 보인다. 4억을 들여 랙을 깔면
+ *   숫자가 4억 줄어들 뿐이고, 그게 매달 4천만원을 벌어 준다는 사실은 어디에도
+ *   안 나온다. 3년 시뮬레이션에서 매출이 2,077만 → 8,869만으로 4.3배가 되는
+ *   동안 현금은 계속 1~2억이었다. "돈 버는 속도가 느리다"는 감각의 절반은
+ *   실제 균형이 아니라 **보여 주는 지표**의 문제였다.
+ *   장부가는 철거 환급률(40%)보다 후하게 잡는다 — 운영 중인 설비는 고철이
+ *   아니라 현금흐름을 낳는 자산이기 때문이다. */
+export function netWorth(S) {
+  let asset = 0;
+  for (const f of S.floors) for (const t of f.tiles) if (t) asset += (PLACEABLE[t.type]?.cost || 0) * 0.6;
+  for (const k in S.plantCounts) asset += (PLANT[k]?.cost || 0) * (S.plantCounts[k] || 0) * 0.6;
+  return { cash: S.cash, asset, total: S.cash + asset };
 }
 
 export function fmtMoney(n) {
