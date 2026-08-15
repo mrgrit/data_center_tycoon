@@ -86,9 +86,28 @@ function tabs(barId, prefix) {
 tabs('leftTabs', ['build', 'plant', 'staff']);
 tabs('rightTabs', ['offers', 'active', 'pnl', 'log']);
 
+/* ★ 돈이 나가는 행동에는 짧은 잠금을 둔다.
+ *   목록이 초당 20번 갈아 끼워지던 시절에 생긴 습관 — 안 눌리니까 연타하게
+ *   되고, 수주 버튼을 연타하면 첫 클릭으로 그 제안이 목록에서 빠지면서
+ *   **아래 제안이 그 자리로 올라와** 원하지 않은 계약이 하나 더 들어온다.
+ *   근본 원인(재렌더)은 ui.js 에서 고쳤고, 이건 남은 오조작을 막는 안전장치다.
+ *   도구 선택처럼 되돌릴 수 있는 것은 잠그지 않는다. */
+let lockUntil = 0;
+const COSTLY = 'data-plant,data-hire,data-accept,data-drop';
+
 document.body.addEventListener('click', (e) => {
   const el = e.target.closest('[data-tool],[data-plant],[data-hire],[data-accept],[data-reject],[data-drop],[data-floor],#btnFloor');
   if (!el) return;
+  const costly = el.matches('[data-plant],[data-hire],[data-accept],[data-drop]') || el.id === 'btnFloor';
+  if (costly) {
+    /* 막힌 클릭도 잠금을 **연장**한다. 안 그러면 연타가 잠금 구간을 여러 개
+       걸쳐서 두세 번 적용된다 — 실측으로 4연타에 2대가 증설됐다.
+       연장하면 "손을 뗀 뒤 320ms" 가 기준이 되어 버스트 전체가 한 번이 된다. */
+    const now = Date.now();
+    const blocked = now < lockUntil;
+    lockUntil = now + 320;
+    if (blocked) { U.hint('연속 클릭은 한 번만 적용된다'); return; }
+  }
   let err = null;
   if (el.dataset.tool) { U.state.tool = U.state.tool === el.dataset.tool ? null : el.dataset.tool; }
   else if (el.dataset.plant) err = W.buyPlant(S, el.dataset.plant);

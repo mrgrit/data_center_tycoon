@@ -96,3 +96,7 @@ main{flex:1; display:grid; grid-template-columns:270px 1fr 300px; min-height:0}
               border-top:1px solid var(--dim2); font-size:13px; }
 .pnlrow.tot span { color:var(--ink); }
 .pnlnote { font-size:11px; color:var(--dim2); margin:-1px 0 4px; line-height:1.45; }
+
+/* 살 수 없는 항목은 살 수 없어 보여야 한다 — 눌러 보고 나서 알게 하지 않는다 */
+.item.poor { opacity:.55 }
+.item.poor .price { color:var(--bad) }

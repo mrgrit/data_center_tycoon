@@ -53,20 +53,40 @@ function statHtml(S) {
     ${!S.blackout && S.shedKw > 0 ? `<div class="stat"><b class="bad">${S.shedKw.toFixed(0)} kW</b><span>용량 초과로 차단됨 (${esc((S.shedNames || []).join(', '))})</span></div>` : ''}`;
 }
 
-export function renderStats(S) { $('stats').innerHTML = statHtml(S); }
+let lastStats = '';
+export function renderStats(S) {
+  const html = statHtml(S);
+  if (html === lastStats) return;         // 같은 내용을 다시 그리면 헤더가 깜빡인다
+  lastStats = html; $('stats').innerHTML = html;
+}
 
 function once(key, val, fn) {
   if (sig[key] === val) return;
   sig[key] = val; fn();
 }
 
+/* ★ 목록 서명에 잔액(S.cash)을 그대로 넣고 있었다. 잔액은 매 틱 바뀌므로
+ *   목록이 **초당 20번 통째로 갈아 끼워졌다.** 사람 손가락은 버튼 위에
+ *   80~150ms 머무는데, 그 사이에 버튼이 사라지면 mousedown 과 mouseup 이
+ *   다른 요소에 떨어져 click 이 아예 발생하지 않는다.
+ *   실측: 사람 속도(90ms 유지)로 12번 눌러서 **0번 먹혔다.**
+ *   그래서 "안 눌려서 막 누르다 보면 두 번 된다"가 됐고, 건설 도구도
+ *   선택이 안 바뀐 채 이전 도구가 설치됐다.
+ *
+ *   잔액이 목록에 실제로 필요한 이유는 하나뿐이다 — **살 수 있는지 여부.**
+ *   그건 가격선을 넘을 때만 바뀌므로, 잔액 대신 그 여부만 서명에 넣는다.
+ *   초당 20번이 아니라 몇 분에 한 번 다시 그린다. */
+const afford = (S, costs) => costs.map((c) => (S.cash >= c ? '1' : '0')).join('');
+
 export function renderBuild(S) {
-  const k = `${S.cash | 0}|${state.tool}`;
+  const specs = [...Object.values(RACKS), ...Object.values(COOLERS)];
+  const nextFloor = FLOOR_COST[S.floors.length + 1] || 0;
+  const k = `${state.tool}|${S.floors.length}|${afford(S, [...specs.map((x) => x.cost), nextFloor])}`;
   once('build', k, () => {
     const card = (s) => `
-      <div class="item ${state.tool === s.id ? 'sel' : ''}" data-tool="${s.id}">
+      <div class="item ${state.tool === s.id ? 'sel' : ''} ${S.cash < s.cost ? 'poor' : ''}" data-tool="${s.id}">
         <h4><span><span class="swatch" style="background:${s.color}"></span>${s.name}</span>
-            <span class="price">${fmtMoney(s.cost)}</span></h4>
+            <span class="price ${S.cash < s.cost ? 'bad' : ''}">${fmtMoney(s.cost)}</span></h4>
         <div class="spec">${s.kind === 'rack'
           ? `수용 ${s.capacityKw}kW · ${s.cooling === 'liquid' ? '액랭' : '공랭'}`
           : `제열 ${s.removeKw}kW · COP ${s.cop} · ${s.serves === 'liquid' ? '액랭' : '공랭'}`}
@@ -78,13 +98,13 @@ export function renderBuild(S) {
       Object.values(RACKS).map(card).join('') +
       `<div style="height:6px"></div>` +
       Object.values(COOLERS).map(card).join('') +
-      (FLOOR_COST[S.floors.length + 1]
-        ? `<button id="btnFloor" style="margin-top:6px">${S.floors.length + 1}층 개설 — ${fmtMoney(FLOOR_COST[S.floors.length + 1])}</button>` : '');
+      (nextFloor
+        ? `<button id="btnFloor" style="margin-top:6px" ${S.cash < nextFloor ? 'disabled' : ''}>${S.floors.length + 1}층 개설 — ${fmtMoney(nextFloor)}</button>` : '');
   });
 }
 
 export function renderPlant(S) {
-  const k = Object.values(S.plantCounts).join(',') + '|' + (S.cash | 0);
+  const k = Object.values(S.plantCounts).join(',') + '|' + afford(S, Object.values(PLANT).map((x) => x.cost));
   once('plant', k, () => {
     $('tabPlant').innerHTML = Object.values(PLANT).map((p) => {
       const n = S.plantCounts[p.id] || 0;
@@ -99,28 +119,29 @@ export function renderPlant(S) {
             <span class="price">${fmtMoney(p.cost)}</span></h4>
         <div class="spec">${add} · 월 ${fmtMoney(p.opex)}</div>
         <p>${p.desc}</p>
-        <div class="row"><button data-plant="${p.id}" ${n >= p.max ? 'disabled' : ''}>
-          ${n >= p.max ? '최대' : '증설'}</button></div>
+        <div class="row"><button data-plant="${p.id}" ${n >= p.max || S.cash < p.cost ? 'disabled' : ''}>
+          ${n >= p.max ? '최대' : S.cash < p.cost ? '자금 부족' : '증설'}</button></div>
       </div>`;
     }).join('');
   });
 }
 
 export function renderStaff(S) {
-  once('staff', S.staff.map((s) => s.id).join(',') + (S.cash | 0), () => {
+  once('staff', S.staff.map((s) => s.id).join(',') + afford(S, Object.values(STAFF).map((x) => x.salary * 2)), () => {
     $('tabStaff').innerHTML = Object.values(STAFF).map((s) => {
       const has = S.staff.some((x) => x.id === s.id);
       return `<div class="item">
         <h4><span>${s.name}</span><span class="price">월 ${fmtMoney(s.salary)}</span></h4>
         <p>${s.desc}</p>
-        <div class="row"><button data-hire="${s.id}" ${has ? 'disabled' : ''}>${has ? '고용됨' : '채용'}</button></div>
+        <div class="row"><button data-hire="${s.id}" ${has || S.cash < s.salary * 2 ? 'disabled' : ''}>${
+          has ? '고용됨' : S.cash < s.salary * 2 ? '두 달치 급여 필요' : '채용'}</button></div>
       </div>`;
     }).join('');
   });
 }
 
 export function renderOffers(S) {
-  once('offers', S.offers.map((o) => o.id).join(',') + (S.cash | 0), () => {
+  once('offers', S.offers.map((o) => o.id).join(','), () => {
     $('tabOffers').innerHTML = S.offers.length ? S.offers.map((o) => `
       <div class="item">
         <h4><span><span class="swatch" style="background:${o.color}"></span>${o.name}</span>
@@ -135,7 +156,8 @@ export function renderOffers(S) {
 
 export function renderActive(S) {
   const act = S.contracts.filter((c) => c.active);
-  once('active', act.map((c) => `${c.id}:${c.downMin | 0}`).join(','), () => {
+  /* 장애 중에는 downMin 이 매 틱 늘어난다 — 5분 단위로 뭉개야 목록이 안 튄다 */
+  once('active', act.map((c) => `${c.id}:${Math.round(c.downMin / 5)}:${c.shed ? 1 : 0}`).join(','), () => {
     $('tabActive').innerHTML = act.length ? act.map((c) => {
       const up = c.totalMin ? (1 - c.downMin / c.totalMin) * 100 : 100;
       const ok = up >= c.sla;
